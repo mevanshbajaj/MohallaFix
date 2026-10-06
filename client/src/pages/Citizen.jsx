@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, errMsg } from '../api';
-import { Badge, Empty, Spinner, ago } from '../components/ui';
+import { Badge, PriorityBadge, Empty, Spinner, ago } from '../components/ui';
 import { MapView, Legend, DEFAULT_CENTER } from '../components/Maps';
 
 export function ComplaintRow({ c, to }) {
@@ -13,7 +13,7 @@ export function ComplaintRow({ c, to }) {
         <div className="text-sm text-slate-500">#{c.public_id} · {c.area_name || 'Unknown area'} · {ago(c.created_at)}</div>
         {c.sla_breached && !['resolved', 'verified'].includes(c.status) && <div className="text-xs font-semibold text-pending mt-0.5">Past target date</div>}
       </div>
-      <Badge status={c.status} />
+      <div className="flex flex-col items-end gap-1"><Badge status={c.status} />{c.priority && <PriorityBadge priority={c.priority} />}</div>
     </Link>
   );
 }

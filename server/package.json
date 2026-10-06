@@ -5,6 +5,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
+    "db:migrate": "node db/migrate.js",
     "db:seed": "node db/seed.js"
   },
   "engines": { "node": ">=18" },

@@ -3,8 +3,8 @@ import { z } from 'zod';
 import { q, tx } from '../db.js';
 import { wrap, HttpError } from '../middleware/error.js';
 import { auth, requireRole } from '../middleware/auth.js';
-import { upload } from '../middleware/upload.js';
-import { saveImage } from '../services/storage.js';
+import { uploadPhoto, uploadPhotos, filesOf } from '../middleware/upload.js';
+import { saveImages, deleteImages } from '../services/storage.js';
 import { addEvent, changeStatus, nearestAreaId, getComplaintDetail, LIST_SQL, DIST_SQL, lockComplaint } from '../services/complaintService.js';
 
 const r = Router();
@@ -15,6 +15,9 @@ const createSchema = z.object({
   lng: z.coerce.number().min(-180).max(180),
   location_source: z.enum(['gps', 'manual']).default('gps'),
   description: z.string().trim().max(500).optional(),
+  address: z.string().trim().max(200).optional(),
+  // The citizen's own view of how serious it is. Never CRITICAL: only staff set that.
+  priority_hint: z.enum(['low', 'medium', 'high']).optional(),
 });
 
 // Public: minimal status lookup by complaint ID (e.g. MH10293). No names, rounded coordinates.
@@ -24,10 +27,11 @@ r.get('/track/:publicId', wrap(async (req, res) => {
 
 r.use(auth);
 
-// Create a complaint (citizens)
-r.post('/', requireRole('citizen'), upload.single('photo'), wrap(async (req, res) => {
+// Create a complaint (citizens): 1-4 photos
+r.post('/', requireRole('citizen'), ...uploadPhotos, wrap(async (req, res) => {
   const b = createSchema.parse(req.body);
-  if (!req.file) throw new HttpError(422, 'PHOTO_REQUIRED', 'Please add a photo of the problem');
+  const files = filesOf(req);
+  if (!files.length) throw new HttpError(422, 'PHOTO_REQUIRED', 'Please add a photo of the problem');
 
   // Abuse guard: 10 reports per citizen per day
   const { rows: [{ n }] } = await q(`SELECT count(*)::int AS n FROM complaints WHERE citizen_id = $1 AND created_at > now() - interval '1 day'`, [req.user.id]);
@@ -38,28 +42,34 @@ r.post('/', requireRole('citizen'), upload.single('photo'), wrap(async (req, res
       AND c.created_at > now() - interval '2 minutes' AND ${DIST_SQL} < 20 LIMIT 1`, [b.lat, b.lng, req.user.id, b.category_id]);
   if (dup.rows[0]) throw new HttpError(409, 'JUST_REPORTED', `You already reported this as #${dup.rows[0].public_id}`);
 
-  const { rows: [cat] } = await q('SELECT id, sla_hours, department_id FROM categories WHERE id = $1', [b.category_id]);
+  const { rows: [cat] } = await q('SELECT id, sla_hours, department_id, default_priority FROM categories WHERE id = $1 AND is_active', [b.category_id]);
   if (!cat) throw new HttpError(422, 'BAD_CATEGORY', 'Unknown category');
 
-  const img = await saveImage(req.file.buffer); // upload first; a failed upload creates no complaint
+  const imgs = await saveImages(files.map((f) => f.buffer)); // all-or-nothing; a failed upload creates no complaint
 
-  const created = await tx(async (db) => {
-    const areaId = await nearestAreaId(db, b.lat, b.lng);
-    const { rows } = await db.query(
-      `INSERT INTO complaints (citizen_id, category_id, area_id, department_id, description, lat, lng, location_source, sla_due_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now() + make_interval(hours => $9))
-       RETURNING id, public_id, status, sla_due_at`,
-      [req.user.id, cat.id, areaId, cat.department_id, b.description || null, b.lat, b.lng, b.location_source, cat.sla_hours]);
-    const c = rows[0];
-    await db.query(`INSERT INTO complaint_media (complaint_id, uploaded_by, kind, url, public_id) VALUES ($1,$2,'before',$3,$4)`, [c.id, req.user.id, img.url, img.publicId]);
-    await addEvent(db, c.id, req.user.id, null, 'submitted', 'Complaint submitted');
-    return c;
-  });
+  let created;
+  try {
+    created = await tx(async (db) => {
+      const areaId = await nearestAreaId(db, b.lat, b.lng);
+      // Priority comes from the category's rule. The citizen's hint is stored for staff to see, not trusted.
+      const { rows } = await db.query(
+        `INSERT INTO complaints (citizen_id, category_id, area_id, department_id, description, lat, lng, address_text, location_source,
+                                 priority, priority_suggested, sla_due_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now() + make_interval(hours => $12))
+         RETURNING id, public_id, status, priority, sla_due_at`,
+        [req.user.id, cat.id, areaId, cat.department_id, b.description || null, b.lat, b.lng, b.address || null, b.location_source,
+         cat.default_priority, b.priority_hint || null, cat.sla_hours]);
+      const c = rows[0];
+      for (const i of imgs) await db.query(`INSERT INTO complaint_media (complaint_id, uploaded_by, kind, url, public_id) VALUES ($1,$2,'before',$3,$4)`, [c.id, req.user.id, i.url, i.publicId]);
+      await addEvent(db, c.id, req.user.id, null, 'submitted', 'Complaint submitted');
+      return c;
+    });
+  } catch (e) { await deleteImages(imgs.map((i) => i.publicId)); throw e; } // do not leave orphan photos behind
 
   // Similar open reports within 50 m: lets the client suggest "me too" next time
   const near = await q(`SELECT c.id, c.public_id, c.upvotes FROM complaints c WHERE c.category_id = $3 AND c.id <> $4
-      AND c.status NOT IN ('resolved','verified') AND ${DIST_SQL} < 50 LIMIT 5`, [b.lat, b.lng, cat.id, created.id]);
-  res.status(201).json({ ...created, nearby_duplicates: near.rows });
+      AND c.status NOT IN ('resolved','verified','rejected') AND ${DIST_SQL} < 50 LIMIT 5`, [b.lat, b.lng, cat.id, created.id]);
+  res.status(201).json({ ...created, images: imgs.length, nearby_duplicates: near.rows });
 }));
 
 r.get('/mine', requireRole('citizen'), wrap(async (req, res) => {
@@ -74,7 +84,7 @@ r.get('/nearby', wrap(async (req, res) => {
     `SELECT c.id, c.public_id, c.status, c.lat, c.lng, c.upvotes, c.created_at, cat.label AS category_label, cat.icon AS category_icon,
             ${DIST_SQL} AS distance_m
      FROM complaints c JOIN categories cat ON cat.id = c.category_id
-     WHERE c.status NOT IN ('resolved','verified') AND ${DIST_SQL} < $3
+     WHERE c.status NOT IN ('resolved','verified','rejected') AND ${DIST_SQL} < $3
      ORDER BY distance_m LIMIT 200`, [p.lat, p.lng, p.radius]);
   res.json(rows);
 }));
@@ -101,11 +111,11 @@ r.post('/:id/upvote', requireRole('citizen'), wrap(async (req, res) => {
 }));
 
 // Citizen verifies the fix: yes -> verified, no -> reopened
-r.post('/:id/verify', requireRole('citizen'), upload.single('photo'), wrap(async (req, res) => {
+r.post('/:id/verify', requireRole('citizen'), ...uploadPhoto, wrap(async (req, res) => {
   const id = z.string().uuid().parse(req.params.id);
   const b = z.object({ is_resolved: z.union([z.boolean(), z.enum(['true', 'false'])]), comment: z.string().trim().max(500).optional() }).parse(req.body);
   const yes = b.is_resolved === true || b.is_resolved === 'true';
-  const img = req.file ? await saveImage(req.file.buffer) : null;
+  const img = req.file ? (await saveImages([req.file.buffer]))[0] : null;
   const status = await tx(async (db) => {
     const c = await lockComplaint(db, id);
     if (c.citizen_id !== req.user.id) throw new HttpError(403, 'FORBIDDEN', 'Only the reporter can verify');
@@ -118,6 +128,46 @@ r.post('/:id/verify', requireRole('citizen'), upload.single('photo'), wrap(async
     return yes ? 'verified' : 'reopened';
   });
   res.json({ status });
+}));
+
+// Evidence photos may be added/removed by the reporter while the complaint is still being reviewed
+const EDITABLE = ['submitted', 'under_review', 'reopened'];
+
+r.post('/:id/images', requireRole('citizen'), ...uploadPhotos, wrap(async (req, res) => {
+  const id = z.string().uuid().parse(req.params.id);
+  const files = filesOf(req);
+  if (!files.length) throw new HttpError(422, 'PHOTO_REQUIRED', 'Choose a photo to add');
+  const c = (await q('SELECT citizen_id, status FROM complaints WHERE id = $1', [id])).rows[0];
+  if (!c) throw new HttpError(404, 'NOT_FOUND', 'Complaint not found');
+  if (c.citizen_id !== req.user.id) throw new HttpError(403, 'FORBIDDEN', 'Only the reporter can add photos');
+  if (!EDITABLE.includes(c.status)) throw new HttpError(409, 'LOCKED', 'Photos can no longer be added to this complaint');
+  const { rows: [{ n }] } = await q(`SELECT count(*)::int AS n FROM complaint_media WHERE complaint_id = $1 AND kind = 'before'`, [id]);
+  if (n + files.length > 4) throw new HttpError(422, 'TOO_MANY', `A complaint can have at most 4 photos (it has ${n})`);
+  const imgs = await saveImages(files.map((f) => f.buffer));
+  try {
+    for (const i of imgs) await q(`INSERT INTO complaint_media (complaint_id, uploaded_by, kind, url, public_id) VALUES ($1,$2,'before',$3,$4)`, [id, req.user.id, i.url, i.publicId]);
+  } catch (e) { await deleteImages(imgs.map((i) => i.publicId)); throw e; }
+  res.status(201).json((await q('SELECT id, kind, url, created_at FROM complaint_media WHERE complaint_id = $1 ORDER BY created_at', [id])).rows);
+}));
+
+r.delete('/:id/images/:imageId', requireRole('citizen', 'admin'), wrap(async (req, res) => {
+  const id = z.string().uuid().parse(req.params.id), imageId = z.string().uuid().parse(req.params.imageId);
+  const removed = await tx(async (db) => {
+    const c = await lockComplaint(db, id);
+    const m = (await db.query('SELECT id, kind, uploaded_by, public_id FROM complaint_media WHERE id = $1 AND complaint_id = $2', [imageId, id])).rows[0];
+    if (!m) throw new HttpError(404, 'NOT_FOUND', 'Photo not found');
+    if (req.user.role === 'citizen') {
+      if (c.citizen_id !== req.user.id || m.uploaded_by !== req.user.id) throw new HttpError(403, 'FORBIDDEN', 'You can only remove your own photos');
+      if (m.kind === 'before' && !EDITABLE.includes(c.status)) throw new HttpError(409, 'LOCKED', 'Photos can no longer be changed');
+      if (m.kind === 'after') throw new HttpError(403, 'FORBIDDEN', 'You cannot remove resolution photos');
+      const left = (await db.query(`SELECT count(*)::int AS n FROM complaint_media WHERE complaint_id = $1 AND kind = 'before'`, [id])).rows[0].n;
+      if (m.kind === 'before' && left <= 1) throw new HttpError(409, 'LAST_PHOTO', 'A complaint needs at least one photo');
+    }
+    await db.query('DELETE FROM complaint_media WHERE id = $1', [imageId]);
+    return m.public_id;
+  });
+  await deleteImages([removed]); // remove the stored asset only after the DB change committed
+  res.json({ ok: true });
 }));
 
 export default r;

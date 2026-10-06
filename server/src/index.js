@@ -6,6 +6,8 @@ import { config } from './config.js';
 import { notFound, errorHandler } from './middleware/error.js';
 import { UPLOAD_DIR } from './services/storage.js';
 import { startJobs } from './jobs/cron.js';
+import { pool } from './db.js';
+import { migrate } from '../db/migrate.js';
 import authRoutes from './routes/auth.js';
 import metaRoutes from './routes/meta.js';
 import complaintRoutes from './routes/complaints.js';
@@ -29,6 +31,7 @@ app.use('/api/v1/admin', adminRoutes);
 app.use(notFound);
 app.use(errorHandler);
 
+await migrate(pool); // applies any pending db/migrations/*.sql before accepting traffic
 app.listen(config.port, () => {
   console.log(`MohallaFix API on :${config.port}`);
   startJobs();

@@ -2,10 +2,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, errMsg } from '../api';
 import { useAuth } from '../auth';
-import { Badge, ErrorBox, PhotoCapture, Spinner, Timeline, STATUS_LABEL, fmtDate } from '../components/ui';
+import { Badge, PriorityBadge, ErrorBox, PhotoCapture, Spinner, Timeline, STATUS_LABEL, PRIORITY, fmtDate } from '../components/ui';
 import { MapView } from '../components/Maps';
 
-const NEXT = { submitted: ['assigned'], assigned: ['worker_notified', 'in_progress'], worker_notified: ['in_progress'], in_progress: ['resolved'], resolved: ['verified', 'reopened'], reopened: ['assigned'], verified: [] };
+const NEXT = { submitted: ['under_review', 'assigned', 'rejected'], under_review: ['assigned', 'rejected'], assigned: ['worker_notified', 'in_progress'], worker_notified: ['in_progress'], in_progress: ['resolved'], resolved: ['verified', 'reopened'], reopened: ['under_review', 'assigned', 'rejected'], rejected: ['reopened'], verified: [] };
 
 function Photos({ media }) {
   const label = { before: 'Reported', after: 'Work done', verification: 'Citizen check' };
@@ -23,7 +23,7 @@ function Photos({ media }) {
 }
 
 function Summary({ c }) {
-  const open = !['resolved', 'verified'].includes(c.status);
+  const open = !['resolved', 'verified', 'rejected'].includes(c.status);
   return (
     <div className="card space-y-3">
       <div className="flex justify-between gap-3 items-start">
@@ -31,8 +31,9 @@ function Summary({ c }) {
           <h1 className="text-2xl font-bold">{c.category_icon} {c.category_label}</h1>
           <p className="text-slate-500 text-sm">#{c.public_id} · {c.area_name || 'Unknown area'} · reported {fmtDate(c.created_at)}</p>
         </div>
-        <Badge status={c.status} />
+        <div className="flex flex-col items-end gap-1"><Badge status={c.status} />{c.priority && <PriorityBadge priority={c.priority} />}</div>
       </div>
+      {c.address_text && <p className="text-sm">📍 {c.address_text}</p>}
       {c.description && <p>{c.description}</p>}
       <p className={`text-sm ${open && c.sla_breached ? 'text-pending font-semibold' : 'text-slate-600'}`}>
         {open ? (c.sla_breached ? 'Past the target date of ' : 'Target fix date: ') : 'Target was '}{fmtDate(c.sla_due_at)}
@@ -101,10 +102,14 @@ function WorkerBox({ c, reload }) {
 function AdminBox({ c, reload }) {
   const [workers, setWorkers] = useState([]);
   const [w, setW] = useState(c.assigned_worker_id || '');
-  const [note, setNote] = useState(''); const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState(''); const [reason, setReason] = useState(''); const [pri, setPri] = useState(c.priority); const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
   useEffect(() => { api.get('/admin/workers').then((r) => setWorkers(r.data.filter((x) => x.is_active))); }, []);
   const run = async (fn) => { setBusy(true); setErr(''); try { await fn(); await reload(); } catch (e) { setErr(errMsg(e)); } finally { setBusy(false); } };
-  const canAssign = !['resolved', 'verified'].includes(c.status);
+  const canAssign = !['resolved', 'verified', 'rejected'].includes(c.status);
+  const setStatus = (s) => {
+    if (s === 'rejected' && !reason.trim()) return setErr('Please write the reason for rejecting this complaint first.');
+    return run(() => api.patch(`/admin/complaints/${c.id}/status`, { status: s, note: reason.trim() || undefined }).then(() => setReason('')));
+  };
   const moves = NEXT[c.status].filter((s) => !['assigned', 'worker_notified'].includes(s));
   return (
     <div className="card space-y-4">
@@ -119,9 +124,17 @@ function AdminBox({ c, reload }) {
           <button className="btn-primary" disabled={!w || busy} onClick={() => run(() => api.patch(`/admin/complaints/${c.id}/assign`, { worker_id: w }))}>{c.assigned_worker_id ? 'Reassign' : 'Assign'}</button>
         </div>
       )}
+      <div>
+        <label className="label" htmlFor="pri">Priority {c.priority_suggested && <span className="font-normal text-slate-500">· citizen suggested {PRIORITY[c.priority_suggested].label}</span>}</label>
+        <div className="flex gap-2">
+          <select id="pri" className="input" value={pri} onChange={(e) => setPri(e.target.value)}>{Object.entries(PRIORITY).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}</select>
+          <button className="btn-ghost" disabled={busy || pri === c.priority} onClick={() => run(() => api.patch(`/admin/complaints/${c.id}/priority`, { priority: pri }))}>Save</button>
+        </div>
+      </div>
       {moves.length > 0 && (
-        <div className="flex gap-2 flex-wrap">
-          {moves.map((s) => <button key={s} className="btn-ghost" disabled={busy} onClick={() => run(() => api.patch(`/admin/complaints/${c.id}/status`, { status: s }))}>Mark {STATUS_LABEL[s].toLowerCase()}</button>)}
+        <div className="space-y-2">
+          <input className="input" placeholder="Reason / remark (required to reject)" value={reason} onChange={(e) => setReason(e.target.value)} aria-label="Reason or remark" />
+          <div className="flex gap-2 flex-wrap">{moves.map((s) => <button key={s} className={s === 'rejected' ? 'btn-danger' : 'btn-ghost'} disabled={busy} onClick={() => setStatus(s)}>{s === 'reopened' ? 'Reopen' : s === 'rejected' ? 'Reject' : `Mark ${STATUS_LABEL[s].toLowerCase()}`}</button>)}</div>
         </div>
       )}
       <div>

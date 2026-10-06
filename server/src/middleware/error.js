@@ -12,21 +12,25 @@ export class HttpError extends Error {
 export const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 export function notFound(_req, res) {
-  res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found' } });
+  res.status(404).json({ success: false, message: 'Route not found', error: { code: 'NOT_FOUND', message: 'Route not found' } });
 }
 
 // eslint-disable-next-line no-unused-vars
 export function errorHandler(err, _req, res, _next) {
+  const send = (status, code, message, details) => res.status(status).json({ success: false, message, error: { code, message, details } });
   if (err instanceof ZodError) {
-    return res.status(422).json({ error: { code: 'VALIDATION', message: 'Invalid input', details: err.flatten().fieldErrors } });
+    const f = err.flatten().fieldErrors;
+    const first = Object.entries(f)[0];
+    return send(422, 'VALIDATION', first ? `${first[0]}: ${first[1][0]}` : 'Invalid input', f);
   }
+  if (err.code?.startsWith?.('LIMIT_') && err.code !== 'LIMIT_FILE_SIZE') return send(422, 'BAD_UPLOAD', 'Too many files, or a file was sent in the wrong field');
   if (err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(413).json({ error: { code: 'FILE_TOO_LARGE', message: 'Photo must be under 5 MB' } });
+    return send(413, 'FILE_TOO_LARGE', 'Each photo must be under 5 MB');
   }
   if (err.code === '23505') {
-    return res.status(409).json({ error: { code: 'DUPLICATE', message: 'Already exists' } });
+    return send(409, 'DUPLICATE', 'Already exists');
   }
   const status = err.status || 500;
   if (status === 500) console.error(err);
-  res.status(status).json({ error: { code: err.code || 'SERVER_ERROR', message: status === 500 ? 'Something went wrong' : err.message } });
+  send(status, err.code || 'SERVER_ERROR', status === 500 ? 'Something went wrong' : err.message);
 }

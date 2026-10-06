@@ -30,9 +30,9 @@ export function Dashboard() {
   return (
     <div className="space-y-5">
       <h1 className="text-2xl font-bold">Overview</h1>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <Stat label="Total complaints" value={s.total} /><Stat label="Pending" value={s.pending} color="#c62828" />
-        <Stat label="In progress" value={s.in_progress} color="#c98400" /><Stat label="Resolved" value={s.resolved} color="#2e7d32" />
+        <Stat label="In progress" value={s.in_progress} color="#c98400" /><Stat label="Resolved" value={s.resolved} color="#2e7d32" /><Stat label="Critical (open)" value={s.critical} color="#b00020" />
       </div>
       <div className="grid md:grid-cols-2 gap-4">
         <div className="card space-y-2"><h2 className="font-semibold text-lg">Complaint map</h2>
@@ -50,12 +50,12 @@ export function Dashboard() {
 
 export function Complaints() {
   const [sp] = useSearchParams();
-  const [f, setF] = useState({ status: '', category: '', overdue: sp.get('overdue') === 'true', q: '' });
+  const [f, setF] = useState({ status: '', priority: '', category: '', overdue: sp.get('overdue') === 'true', q: '' });
   const [cats, setCats] = useState([]); const [rows, setRows] = useState(null); const [err, setErr] = useState('');
   useEffect(() => { api.get('/meta/categories').then((r) => setCats(r.data)); }, []);
   useEffect(() => {
     const t = setTimeout(() => {
-      const params = {}; if (f.status) params.status = f.status; if (f.category) params.category = f.category; if (f.overdue) params.overdue = 'true'; if (f.q) params.q = f.q;
+      const params = {}; if (f.status) params.status = f.status; if (f.category) params.category = f.category; if (f.priority) params.priority = f.priority; if (f.overdue) params.overdue = 'true'; if (f.q) params.q = f.q;
       setRows(null); api.get('/admin/complaints', { params }).then((r) => setRows(r.data)).catch((e) => setErr(errMsg(e)));
     }, 250);
     return () => clearTimeout(t);
@@ -67,9 +67,10 @@ export function Complaints() {
   return (
     <div className="space-y-3">
       <div className="flex justify-between items-center"><h1 className="text-2xl font-bold">Complaints</h1><button className="btn-ghost" onClick={exportCsv}>Export CSV</button></div>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
         <input className="input col-span-2 md:col-span-1" placeholder="Search ID or text" aria-label="Search" value={f.q} onChange={(e) => setF({ ...f, q: e.target.value })} />
-        <select className="input" aria-label="Status" value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}><option value="">All statuses</option><option value="pending">Pending</option><option value="in_progress">In progress</option><option value="resolved">Resolved</option></select>
+        <select className="input" aria-label="Status" value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}><option value="">All statuses</option><option value="pending">Pending</option><option value="in_progress">In progress</option><option value="resolved">Resolved</option><option value="rejected">Rejected</option></select>
+        <select className="input" aria-label="Priority" value={f.priority} onChange={(e) => setF({ ...f, priority: e.target.value })}><option value="">All priorities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
         <select className="input" aria-label="Category" value={f.category} onChange={(e) => setF({ ...f, category: e.target.value })}><option value="">All categories</option>{cats.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}</select>
         <label className="flex items-center gap-2 text-sm min-h-[44px]"><input type="checkbox" checked={f.overdue} onChange={(e) => setF({ ...f, overdue: e.target.checked })} /> Overdue only</label>
       </div>

@@ -3,12 +3,14 @@ import { HttpError } from '../middleware/error.js';
 
 /** Allowed lifecycle moves. Everything else is rejected with 409. */
 export const TRANSITIONS = {
-  submitted: ['assigned'],
+  submitted: ['under_review', 'assigned', 'rejected'],
+  under_review: ['assigned', 'rejected'],
   assigned: ['worker_notified', 'in_progress'],
   worker_notified: ['in_progress'],
   in_progress: ['resolved'],
   resolved: ['verified', 'reopened'],
-  reopened: ['assigned'],
+  reopened: ['under_review', 'assigned', 'rejected'],
+  rejected: ['reopened'], // admin can undo a rejection
   verified: [],
 };
 
@@ -47,7 +49,7 @@ export async function changeStatus(db, id, to, actorId, note) {
     [id, to]
   );
   await addEvent(db, id, actorId, c.status, to, note);
-  return { ...c, status: to };
+  return { ...c, previous_status: c.status, status: to };
 }
 
 /** Assigns (or reassigns) a worker. Moves new/reopened complaints to assigned -> worker_notified. */
@@ -55,9 +57,9 @@ export async function assignWorker(db, id, workerId, actorId, note) {
   const { rows } = await db.query(`SELECT id, name, department_id FROM users WHERE id = $1 AND role = 'worker' AND is_active`, [workerId]);
   if (!rows[0]) throw new HttpError(422, 'BAD_WORKER', 'Choose an active worker');
   const c = await lockComplaint(db, id);
-  if (['resolved', 'verified'].includes(c.status)) throw new HttpError(409, 'BAD_TRANSITION', 'Complaint is already resolved');
+  if (['resolved', 'verified', 'rejected'].includes(c.status)) throw new HttpError(409, 'BAD_TRANSITION', 'This complaint is already closed');
   await db.query('UPDATE complaints SET assigned_worker_id = $2, department_id = $3 WHERE id = $1', [id, workerId, rows[0].department_id]);
-  if (['submitted', 'reopened'].includes(c.status)) {
+  if (['submitted', 'under_review', 'reopened'].includes(c.status)) {
     await changeStatus(db, id, 'assigned', actorId, `Assigned to ${rows[0].name}`);
     await changeStatus(db, id, 'worker_notified', null, 'Worker notified');
     if (note) await db.query('INSERT INTO internal_notes (complaint_id, author_id, body) VALUES ($1,$2,$3)', [id, actorId, note]);
@@ -76,12 +78,14 @@ export async function nearestAreaId(db, lat, lng) {
 
 const SELECT_COMPLAINT = `
   SELECT c.id, c.public_id, c.status, c.description, c.lat, c.lng, c.address_text, c.location_source,
-         c.priority, c.upvotes, c.created_at, c.resolved_at, c.verified_at, c.sla_due_at,
-         COALESCE(c.resolved_at, now()) > c.sla_due_at AS sla_breached,
+         c.priority, c.priority_suggested, c.priority_source, c.upvotes, c.created_at, c.resolved_at, c.verified_at, c.sla_due_at,
+         (c.status <> 'rejected' AND COALESCE(c.resolved_at, now()) > c.sla_due_at) AS sla_breached,
          cat.id AS category_id, cat.slug AS category_slug, cat.label AS category_label, cat.icon AS category_icon,
+         root.label AS category_root_label, root.id AS category_root_id,
          a.name AS area_name, c.assigned_worker_id, w.name AS worker_name, c.citizen_id, u.name AS citizen_name
   FROM complaints c
   JOIN categories cat ON cat.id = c.category_id
+  LEFT JOIN categories root ON root.id = COALESCE(cat.parent_id, cat.id)
   JOIN users u ON u.id = c.citizen_id
   LEFT JOIN areas a ON a.id = c.area_id
   LEFT JOIN users w ON w.id = c.assigned_worker_id`;
@@ -102,7 +106,7 @@ export async function getComplaintDetail(where, param, { staff = false, publicVi
   const out = { ...c, media: media.rows, events: events.rows, verification: ver.rows[0] || null };
   if (staff) out.notes = notes.rows;
   if (publicView) { // anonymous tracking: no names, no exact coordinates
-    delete out.citizen_name; delete out.citizen_id; delete out.worker_name; delete out.assigned_worker_id;
+    delete out.citizen_name; delete out.citizen_id; delete out.priority_suggested; delete out.priority_source; delete out.worker_name; delete out.assigned_worker_id;
     out.lat = +out.lat.toFixed(3); out.lng = +out.lng.toFixed(3);
     out.events = out.events.map(({ actor_name, ...e }) => e);
   }
@@ -110,12 +114,14 @@ export async function getComplaintDetail(where, param, { staff = false, publicVi
 }
 
 export const LIST_SQL = `
-  SELECT c.id, c.public_id, c.status, c.created_at, c.sla_due_at, c.lat, c.lng, c.upvotes,
-         COALESCE(c.resolved_at, now()) > c.sla_due_at AS sla_breached,
+  SELECT c.id, c.public_id, c.status, c.priority, c.created_at, c.sla_due_at, c.lat, c.lng, c.upvotes,
+         (c.status <> 'rejected' AND COALESCE(c.resolved_at, now()) > c.sla_due_at) AS sla_breached,
          cat.label AS category_label, cat.icon AS category_icon, cat.slug AS category_slug,
+         root.label AS category_root_label, root.id AS category_root_id,
          a.name AS area_name, w.name AS worker_name,
          (SELECT url FROM complaint_media m WHERE m.complaint_id = c.id AND m.kind = 'before' LIMIT 1) AS thumb
   FROM complaints c
   JOIN categories cat ON cat.id = c.category_id
+  LEFT JOIN categories root ON root.id = COALESCE(cat.parent_id, cat.id)
   LEFT JOIN areas a ON a.id = c.area_id
   LEFT JOIN users w ON w.id = c.assigned_worker_id`;
